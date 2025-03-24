@@ -15,6 +15,7 @@ The whole process can be splited into 5 steps:
 '''
 from bvh import Animation
 from scipy.signal import butter, filtfilt
+import numpy as np
 
 class LBFGS(object):
     '''
@@ -25,7 +26,7 @@ class LBFGS(object):
         self.gtol = gtol
         self.ftol = ftol
 
-def extract_contact_labels(animation, endeffector_ids, target_transforms, threshold=0.1):
+def extract_contact_labels(animation, endeffector_ids, target_translations, dist_threshold=0.05, vel_threshold=0.05):
     """
     Extract contact labels from a motion sequence.
     The main algorithm is referenced from Strake et al. 2020.
@@ -33,18 +34,29 @@ def extract_contact_labels(animation, endeffector_ids, target_transforms, thresh
     1. calculated
 
     Args:
-        motion (np.ndarray): A motion sequence with shape (T, J, 3).
+        animation: Animation object
         endeffector_ids (list): A list of endeffector indices.
-        target_transforms (list): A list of target transforms.
+        target_translations (list): A list of target transforms.
         threshold (float): The threshold for determining contact.
 
     Returns:
-        np.ndarray: A contact label sequence with shape (T, J).
+        contact_labels: A contact label sequence with shape (T, len(ee)).
     """
-    T, J, _ = motion.shape
-    contact_labels = np.zeros((T, J), dtype=np.float32)
-    for t in range(T):
-        for j in endeffector_ids:
-            if np.linalg.norm(motion[t, j] - target_transforms[j]) < threshold:
-                contact_labels[t, j] = 1.0
-    return contact_labels
+    t, j, _ = animation.shape
+    len_ee = len(endeffector_ids)
+    if target_translations.ndim == 1:
+        target_translations = np.expand_dims(target_translations, axis=(0, 1))
+        target_translations.repeat(t, axis=0).repeat(len_ee, axis=1)
+    
+    translations = animation.translations
+    ee_trans = translations[:, endeffector_ids]
+    ee_vel = np.zeros_like(ee_trans)
+    ee_vel[:-1] = np.diff(ee_trans, axis=0)
+
+    assert ee_trans.shape == target_translations.shape, 'The shape of endeffector translations and target translations should be the same.'
+    
+    ee_trans_dist = np.linalg.norm(ee_trans - target_translations, axis=-1)
+    ee_vel_norm = np.linalg.norm(ee_vel, axis=-1)
+    contact_labels = (ee_trans_dist < dist_threshold).astype(np.float32) * (ee_vel_norm < vel_threshold).astype(np.float32)
+    assert contact_labels.shape == (t, len_ee), 'The shape of contact labels is not correct.'
+    return contact_labels.transpose(1, 0)

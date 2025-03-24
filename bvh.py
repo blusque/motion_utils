@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from kinematics import JacobianInverseKinematics
 
 from warnings import warn
 
@@ -14,6 +15,38 @@ reverse_order_map = {
     'Y': 'Yrotation',
     'Z': 'Zrotation'
 }
+
+
+def softmax(x, **kw):
+    softness = kw.pop("softness", 1.0)
+    maxi, mini = np.max(x, **kw), np.min(x, **kw)
+    return maxi + np.log(softness + np.exp(mini - maxi))
+
+
+def softmin(x, **kw):
+    return -softmax(-x, **kw)
+
+
+def alpha(t):
+    return 2.0 * t * t * t - 3.0 * t * t + 1
+
+
+def lerp(a, l, r):
+    return (1 - a) * l + a * r
+
+
+def slerp(t, q1, q2, eps=1e-6):
+    dot = np.dot(q1, q2)
+    if dot < 0.0:
+        q2 = -q2
+        dot = -dot
+    theta = np.arccos(dot)
+    if theta < eps:
+        return q1
+    elif theta < np.pi / 60.0:
+        return (1 - t) * q1 + t * q2
+    else:
+        return (np.sin((1 - t) * theta) * q1 + np.sin(t * theta) * q2) / np.sin(theta)
 
 
 def align_quat(qt: np.ndarray, inplace: bool):
@@ -98,6 +131,16 @@ class Skeleton:
         callback(joint)
         for child in joint.children:
             self._pre_order_traversal(child, callback)
+
+    def get_childrens(self):
+        return self._get_childrens(self.root)
+    
+    def _get_childrens(self, joint: Joint):
+        children = []
+        children.append(joint.children)
+        for child in joint.children:
+            children.extend(self._get_childrens(child))
+        return children
     
     @staticmethod
     def flatten_skeleton(joint: Joint):
@@ -106,6 +149,14 @@ class Skeleton:
         for child in joint.children:
             joints.extend(Skeleton.flatten_skeleton(child))
         return joints
+    
+    def __iter__(self):
+        return self._iter(self.root)
+    
+    def _iter(self, joint: Joint):
+        yield joint
+        for child in joint.children:
+            yield from self._iter(child)
 
 class Animation:
     '''
@@ -116,18 +167,19 @@ class Animation:
         'y': 1,
         'z': 2
     }
-    def __init__(self, root_idx, parents, offsets, channels, positions, rotations, frame_time=0.033333,
+    def __init__(self, names, root_idx, parents, offsets, channels, positions, rotations, frame_time=0.033333,
                  up_axis='y', forward_axis='z', order='XYZ'):
         '''
         Initialize the animation data.
         Input:
             root_idx: int
             parents: np.ndarray, shape=(num_joints,), dtype=int
-            offsets: np.ndarray, shape=(1, num_joints, 3)
+            offsets: np.ndarray, shape=(num_joints, 3)
             positions: np.ndarray, shape=(num_frames, num_joints, 3)
             rotations: np.ndarray, shape=(num_frames, num_joints, 4)
             frame_time: float, optional, default=0.033333
         '''
+        self.names = names
         self.root_idx = root_idx
         self.parents = parents
         self.offsets = offsets
@@ -142,6 +194,10 @@ class Animation:
 
         self.order = order
         self.reset()
+
+    @property
+    def shape(self):
+        return self.positions.shape
 
     def auto_set_up_and_forward_axis(self):
         '''
@@ -178,6 +234,8 @@ class Animation:
         elif min_axis == 2:
             self.forward_axis = 'z'
 
+        print(f'Up axis: {self.up_axis}, Forward axis: {self.forward_axis}')
+
     def reset(self):
         self.translations, self.orientations = self.fk()
         for i in range(len(self.parents)):
@@ -201,7 +259,7 @@ class Animation:
                 translations[:, i] = positions[:, i]
                 orientations[:, i] = rotations[:, i]
             else:
-                offset = self.offsets[0, i]
+                offset = self.offsets[i]
                 translations[:, i] = translations[:, pi] + R.from_quat(orientations[:, pi]).apply(offset)
                 orientations[:, i] = (R.from_quat(orientations[:, pi]) * R.from_quat(rotations[:, i])).as_quat()
 
@@ -219,7 +277,7 @@ class Animation:
         return np.concatenate([self.positions, self.rotations], axis=2)
     
     def sub(self, start, end):
-        return Animation(self.root_idx, self.parents, self.offsets, self.channels, self.positions[start:end], self.rotations[start:end], self.frame_time, self.up_axis, self.forward_axis, self.order)
+        return Animation(self.names, self.root_idx, self.parents.copy(), self.offsets.copy(), self.channels, self.positions[start:end].copy(), self.rotations[start:end].copy(), self.frame_time, self.up_axis, self.forward_axis, self.order)
     
     def _reparent(self, joint_list: list[int] | np.ndarray, root_idx=0):
         new_parents = np.zeros(len(joint_list), dtype=int)
@@ -236,37 +294,144 @@ class Animation:
         new_channels[root_idx] = 6
         new_rotations = self.rotations[:, joint_list].copy()
         new_rotations[:, root_idx] = self.orientations[:, joint_list[root_idx]]
-        return Animation(root_idx, new_parents, self.offsets[:1, joint_list].copy(), new_channels, self.positions[:, joint_list].copy(), new_rotations, self.frame_time, self.up_axis, self.forward_axis, self.order)
+        new_names = [self.names[i] for i in joint_list]
+        return Animation(new_names, root_idx, new_parents, self.offsets[joint_list].copy(), new_channels, self.positions[:, joint_list].copy(), new_rotations, self.frame_time, self.up_axis, self.forward_axis, self.order)
     
     def rest(self):
         rest_position = np.zeros_like(self.translations[:1])
         rest_rotation = np.zeros_like(self.rotations[:1])
         rest_rotation[..., -1] = 1
-        rest_position[:, self.root_idx] = self.offsets[0, self.root_idx]
-        rest_motion = Animation(self.root_idx, self.parents, self.offsets, self.channels, rest_position, rest_rotation, self.frame_time, self.up_axis, self.forward_axis, self.order)
+        rest_position[:, self.root_idx] = self.offsets[self.root_idx]
+        rest_motion = Animation(self.names.copy(), self.root_idx, self.parents.copy(), self.offsets.copy(), self.channels.copy(), rest_position, rest_rotation, self.frame_time, self.up_axis, self.forward_axis, self.order)
         return rest_motion
     
     def offset_snap_to_ground(self):
         rest = self.rest()
         up_idx = Animation.axis_map[self.up_axis]
         rest_foot_position = np.min(rest.translations[0, :, up_idx])
-        self.offsets[:, self.root_idx, up_idx] -= rest_foot_position
+        self.offsets[self.root_idx, up_idx] -= rest_foot_position
         self.reset()
 
     def motion_snap_to_ground(self):
         up_idx = Animation.axis_map[self.up_axis]
+        left_foot_idx = 16
+        right_foot_idx = 19
+        # lowest = softmin(self.translations[:, [left_foot_idx, right_foot_idx], up_idx])
         lowest = np.min(self.translations[:, :, up_idx], axis=(0, 1))
         if abs(lowest) > 1e-6:
             print(f'Lowest: {lowest}')
         self.positions[:, self.root_idx, up_idx] -= lowest
         self.reset()
+
+    def remove_foot_sliding(self, foot, foot_ids, interp_length=10, force_on_floor=True):
+        '''
+        Remove foot sliding from the given animation.
+        Args:
+            animation (Animation): The input animation.
+            foot (list): The foot sliding mask, shape (len(foot_ids), T).
+            foot_ids (list): The foot indices.
+            interp_length (int): The interpolation length.
+            force_on_floor (bool): Whether
+
+        Returns:
+            Animation: The animation without foot sliding.
+        '''
+        T = len(self.translations)
+        target_translations = self.translations.copy()
+
+        for i, fidx in enumerate(foot_ids):
+            fixed = foot[i]  # [T]
+
+            """
+            for t in range(T):
+                glb[t, fidx][1] = max(glb[t, fidx][1], 0.25)
+            """
+
+            s = 0
+            while s < T:
+                while s < T and fixed[s] == 0:
+                    s += 1
+                if s >= T:
+                    break
+                t = s
+                avg = self.translations[t, fidx].copy()
+                while t + 1 < T and fixed[t + 1] == 1:
+                    t += 1
+                    avg += self.translations[t, fidx].copy()
+                avg /= (t - s + 1)
+
+                if force_on_floor:
+                    avg[1] = 0.0
+
+                for j in range(s, t + 1):
+                    target_translations[j, fidx] = avg.copy()
+
+                # print(fixed[s - 1:t + 2])
+
+                s = t + 1
+
+            for s in range(T):
+                if fixed[s] == 1:
+                    continue
+                l, r = None, None
+                consl, consr = False, False
+                for k in range(interp_length):
+                    if s - k - 1 < 0:
+                        break
+                    if fixed[s - k - 1]:
+                        l = s - k - 1
+                        consl = True
+                        break
+                for k in range(interp_length):
+                    if s + k + 1 >= T:
+                        break
+                    if fixed[s + k + 1]:
+                        r = s + k + 1
+                        consr = True
+                        break
+
+                if not consl and not consr:
+                    continue
+                if consl and consr:
+                    litp = lerp(alpha(1.0 * (s - l + 1) / (interp_length + 1)),
+                                target_translations[s, fidx], target_translations[l, fidx])
+                    ritp = lerp(alpha(1.0 * (r - s + 1) / (interp_length + 1)),
+                                target_translations[s, fidx], target_translations[r, fidx])
+                    itp = lerp(alpha(1.0 * (s - l + 1) / (r - l + 1)),
+                            ritp, litp)
+                    target_translations[s, fidx] = itp.copy()
+                    continue
+                if consl:
+                    litp = lerp(alpha(1.0 * (s - l + 1) / (interp_length + 1)),
+                                target_translations[s, fidx], target_translations[l, fidx])
+                    target_translations[s, fidx] = litp.copy()
+                    continue
+                if consr:
+                    ritp = lerp(alpha(1.0 * (r - s + 1) / (interp_length + 1)),
+                                target_translations[s, fidx], target_translations[r, fidx])
+                    target_translations[s, fidx] = ritp.copy()
+
+        targetmap = {}
+        for j in range(target_translations.shape[1]):
+            targetmap[j] = target_translations[:, j]
+        # for fidx in fid:
+        #     targetmap[fidx] = glb[:, fidx]
+
+        positions = self.positions.copy()
+        positions[:, 1:] = self.offsets[1:]
+
+        ik = JacobianInverseKinematics(self.parents.copy(), positions, self.rotations.copy(), targetmap, iterations=10, damping=5.0, silent=False)
+        ik()
+        self.positions[:, 0] = ik.positions[:, 0]
+        self.rotations = ik.rotations
+        self.reset()  
     
-    def rotate_root(self, rotation: R):
-        # self.offsets[0, 0] = rotation.apply(self.offsets[0, 0])
-        self.positions[:, 0] = rotation.apply(self.positions[:, 0])
-        self.rotations[:, 0] = (rotation * R.from_quat(self.rotations[:, 0])).as_quat()
-        self.rotations[:, 0] = align_quat(self.rotations[:, 0], True)
-        self.reset()
+    # def rotate_root(self, rotation: R):
+    #     # self.offsets[0, 0] = rotation.apply(self.offsets[0, 0])
+    #     self.positions[:, 0] = rotation.apply(self.positions[:, 0])
+    #     self.rotations[:, 0] = (rotation * R.from_quat(self.rotations[:, 0])).as_quat()
+    #     self.rotations[:, 0] = align_quat(self.rotations[:, 0], True)
+    #     self.reset()
 
     def rotate_offset(self, up_axis: str):
         warn('This function is experimental and may not work as expected')
@@ -290,13 +455,34 @@ class Animation:
                 raise ValueError(f'{self.up_axis} to {up_axis} not implemented, only support y to z')
             
         rotation = R.from_euler('xyz', rotation, degrees=True)
-        self.offsets[0] = rotation.apply(self.offsets[0])
+        self.offsets = rotation.apply(self.offsets)
         self.positions[:, 0] = rotation.apply(self.positions[:, 0])
 
         for i in range(len(self.parents)):
             self.rotations[:, i] = (rotation * R.from_quat(self.rotations[:, i]) * rotation.inv()).as_quat()
             # self.rotations[:, i] = align_quat(self.rotations[:, i], True)
         self.up_axis = up_axis
+        self.reset()
+
+    def copy(self,):
+        return Animation(self.names.copy(), self.root_idx, self.parents.copy(), self.offsets.copy(), self.channels.copy(), self.positions.copy(), self.rotations.copy(), self.frame_time, self.up_axis, self.forward_axis, self.order)
+    
+    def assign_offsets(self, offsets):
+        if isinstance(offsets, dict):
+            for name in self.names:
+                idx = self.names.index(name)
+                if name in offsets:
+                    self.offsets[idx] = offsets[name].copy()
+        elif isinstance(offsets, np.ndarray):
+            self.offsets = offsets.copy()
+        elif isinstance(offsets, list):
+            self.offsets = np.array(offsets)
+        else:
+            raise ValueError('Unknown type of offsets')
+        self.reset()
+
+    def reset_root_offset(self):
+        self.offsets[self.root_idx] = np.zeros(3)
         self.reset()
 
 class BVHParser:
@@ -431,7 +617,7 @@ class BVHParser:
                 ptr += 1    # Skip '}'
             else:
                 raise ValueError('Unknown line: %s' % lines[ptr])
-        offsets = np.array(offsets).reshape(1, len(offsets), 3)
+        offsets = np.array(offsets)
         parents = np.array(parents)
             
         # Read the motion data
@@ -472,7 +658,7 @@ class BVHParser:
         offsets *= scale
         positions *= scale
 
-        return names, Animation(root_idx, parents, offsets, channel_nums, positions, rotations, frame_time, up_axis, forward_axis, order)
+        return Animation(names, root_idx, parents, offsets, channel_nums, positions, rotations, frame_time, up_axis, forward_axis, order)
     
     @staticmethod
     def slerp(t, q1, q2):
@@ -497,7 +683,7 @@ class BVHParser:
 
 
     @staticmethod
-    def write_bvh(file_path, names, motion_data: Animation, order='XYZ'):
+    def write_bvh(file_path, motion_data: Animation, order='XYZ'):
         '''
         Write a BVH file.
         Input:
@@ -509,7 +695,7 @@ class BVHParser:
         '''
         with open(file_path, 'w') as f:
             f.write('HIERARCHY\n')
-            skeleton = Skeleton.build_skeleton(names, motion_data.parents, motion_data.offsets[0], motion_data.channels)
+            skeleton = Skeleton.build_skeleton(motion_data.names, motion_data.parents, motion_data.offsets, motion_data.channels)
             BVHParser.write_joint(f, skeleton.root, 0, 'ROOT', order)
             f.write('MOTION\n')
             f.write('Frames: %d\n' % motion_data.num_frames)
@@ -570,5 +756,8 @@ class BVHParser:
 
 
 if __name__ == '__main__':
-    names, animation_data = BVHParser.read_bvh('test.bvh')
-    BVHParser.write_bvh('output.bvh', names, animation_data)
+    animation_data = BVHParser.read_bvh('test.bvh')
+    skeleton = Skeleton.build_skeleton(animation_data.names, animation_data.parents, animation_data.offsets, animation_data.channels)
+    for joint in skeleton:
+        print(joint.info.name)
+    BVHParser.write_bvh('output.bvh', animation_data)

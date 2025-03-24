@@ -1,9 +1,26 @@
 import numpy as np
 import scipy.linalg as linalg
+from scipy.spatial.transform import Rotation as R
 
-from bvh import Animation
+from skeleton_tools import descendants_mask
+from skinning import skin
 
-from quaternions import Quaternions
+def forward_kinematics(positions, rotations, parents):
+        '''
+        Forward kinematics.
+        '''
+        translations = np.zeros_like(positions)
+        orientations = np.zeros_like(rotations)
+        for i in range(len(parents)):
+            pi = parents[i]
+            if pi == -1:
+                translations[:, i] = positions[:, i]
+                orientations[:, i] = rotations[:, i]
+            else:
+                translations[:, i] = translations[:, pi] + R.from_quat(orientations[:, pi]).apply(positions[:, i])
+                orientations[:, i] = (R.from_quat(orientations[:, pi]) * R.from_quat(rotations[:, i])).as_quat()
+
+        return translations, orientations
 
 class BasicInverseKinematics:
     """
@@ -161,14 +178,16 @@ class JacobianInverseKinematics:
         defaults to False
     """
     
-    def __init__(self, animation, targets,
+    def __init__(self, parents, positions, rotations, targets,
         references=None, iterations=10,
         recalculate=True, damping=2.0,
         secondary=0.25, translate=False,
         silent=False, weights=None,
         weights_translate=None):
         
-        self.animation = animation
+        self.parents = parents
+        self.positions = positions
+        self.rotations = rotations
         self.targets = targets
         self.references = references
         
@@ -189,39 +208,45 @@ class JacobianInverseKinematics:
         return o
         
     def jacobian(self, x, fp, fr, ts, dsc, tdsc):
-        
+        nf, nj, _ = fp.shape
         """ Find parent rotations """
-        prs = fr[:,self.animation.parents]
-        prs[:,0] = Quaternions.id((1))
+        prs = fr[:,self.parents]
+        prs[:, 0] = np.zeros(4)
+        prs[:, 0, 3] = 1.0
         
         """ Find global positions of target joints """
         tps = fp[:,np.array(list(ts.keys()))]
         
         """ Get partial rotations """
-        qys = Quaternions.from_angle_axis(x[:,1:prs.shape[1]*3:3], np.array([[[0,1,0]]]))
-        qzs = Quaternions.from_angle_axis(x[:,2:prs.shape[1]*3:3], np.array([[[0,0,1]]]))
+        y_rot = x[:, 1:prs.shape[1] * 3:3, None] * np.array([0, 1, 0])
+        z_rot = x[:, 2:prs.shape[1] * 3:3, None] * np.array([0, 0, 1])
+        qys = np.zeros((nf, prs.shape[1], 4))
+        qzs = np.zeros((nf, prs.shape[1], 4))
+        for i in range(nf):
+            qys[i] = R.from_rotvec(y_rot[i]).as_quat()
+            qzs[i] = R.from_rotvec(z_rot[i]).as_quat()
         
         """ Find axis of rotations """
-        es = np.empty((len(x),fr.shape[1]*3, 3))
-        es[:,0::3] = ((prs * qzs) * qys) * np.array([[[1,0,0]]])
-        es[:,1::3] = ((prs * qzs) * np.array([[[0,1,0]]]))
-        es[:,2::3] = ((prs * np.array([[[0,0,1]]])))
+        es = np.empty((nf, fr.shape[1] * 3, 3))
+        for j in range(nj):
+            es[:, 3 * j + 0] = ((R.from_quat(prs[:, j]) * R.from_quat(qzs[:, j])) * R.from_quat(qys[:, j])).apply(np.array([1,0,0]))
+            es[:, 3 * j + 1] = (R.from_quat(prs[:, j]) * R.from_quat(qzs[:, j])).apply(np.array([0,1,0]))
+            es[:, 3 * j + 2] = R.from_quat(prs[:, j]).apply(np.array([0,0,1]))
         
         """ Construct Jacobian """
         j = fp.repeat(3, axis=1)
-        j = dsc[np.newaxis,:,:,np.newaxis] * (tps[:,np.newaxis,:] - j[:,:,np.newaxis])
-        j = self.cross(es[:,:,np.newaxis,:], j)
-        j = np.swapaxes(j.reshape((len(x), fr.shape[1]*3, len(ts)*3)), 1, 2)
+        j = dsc[None, :, :, None] * (tps[:, None, :] - j[:, :, None])
+        j = self.cross(es[:, :, None, :], j)
+        j = np.swapaxes(j.reshape((nf, fr.shape[1] * 3, len(ts) * 3)), 1, 2)
                 
         if self.translate:
-            
-            es = np.empty((len(x),fr.shape[1]*3, 3))
-            es[:,0::3] = prs * np.array([[[1,0,0]]])
-            es[:,1::3] = prs * np.array([[[0,1,0]]])
-            es[:,2::3] = prs * np.array([[[0,0,1]]])
+            es = np.empty((nf, fr.shape[1] * 3, 3))
+            es[:, 0::3] = prs * np.array([[[1, 0, 0]]])
+            es[:, 1::3] = prs * np.array([[[0, 1, 0]]])
+            es[:, 2::3] = prs * np.array([[[0, 0, 1]]])
             
             jt = tdsc[np.newaxis,:,:,np.newaxis] * es[:,:,np.newaxis,:].repeat(tps.shape[1], axis=2)
-            jt = np.swapaxes(jt.reshape((len(x), fr.shape[1]*3, len(ts)*3)), 1, 2)
+            jt = np.swapaxes(jt.reshape((nf, fr.shape[1]*3, len(ts)*3)), 1, 2)
             
             j = np.concatenate([j, jt], axis=-1)
         
@@ -234,16 +259,16 @@ class JacobianInverseKinematics:
         
         """ Calculate Masses """
         if self.weights is None:
-            self.weights = np.ones(self.animation.shape[1])
+            self.weights = np.ones(len(self.parents))
             
         if self.weights_translate is None:
-            self.weights_translate = np.ones(self.animation.shape[1])
+            self.weights_translate = np.ones(len(self.parents))
         
         """ Calculate Descendants """
         if self.descendants is None:
-            self.descendants = AnimationStructure.descendants_mask(self.animation.parents)
+            self.descendants = descendants_mask(self.parents)
         
-        self.tdescendants = np.eye(self.animation.shape[1]) + self.descendants
+        self.tdescendants = np.eye(len(self.parents)) + self.descendants
         
         self.first_descendants = self.descendants[:,np.array(list(self.targets.keys()))].repeat(3, axis=0).astype(int)
         self.first_tdescendants = self.tdescendants[:,np.array(list(self.targets.keys()))].repeat(3, axis=0).astype(int)
@@ -257,38 +282,37 @@ class JacobianInverseKinematics:
             self.second_tdescendants = self.tdescendants.repeat(3, axis=0).astype(int)
             self.second_targets = dict([(i, self.references[:,i]) for i in range(self.references.shape[1])])
         
-        nf = len(self.animation)
-        nj = self.animation.shape[1]
+        nf = len(self.positions)
+        nj = self.positions.shape[1]
         
         if not self.silent:
-            gp = Animation.positions_global(self.animation)
-            gp = gp[:,np.array(list(self.targets.keys()))]            
-            error = np.mean(np.sqrt(np.sum((self.endeff - gp)**2.0, axis=2)))
+            translations, _ = forward_kinematics(self.positions, self.rotations, self.parents)
+            ee_translations = translations[:,np.array(list(self.targets.keys()))]     
+            error = np.mean(np.sqrt(np.sum((self.endeff - ee_translations)**2.0, axis=2)))
             print('[JacobianInverseKinematics] Start | Error: %f' % error)
         
         for i in range(self.iterations):
 
             """ Get Global Rotations & Positions """
-            gt = Animation.transforms_global(self.animation)
-            gp = gt[:,:,:,3]
-            gp = gp[:,:,:3] / gp[:,:,3,np.newaxis]
-            gr = Quaternions.from_transforms(gt)
+            translations, orientations = forward_kinematics(self.positions, self.rotations, self.parents)
             
-            x = self.animation.rotations.euler().reshape(nf, -1)
+            x = np.zeros((nf, nj * 3))
+            for f in range(nf):
+                x[f] = R.from_quat(self.rotations[f]).as_euler('XYZ').reshape(-1)
             w = self.weights.repeat(3)
             
             if self.translate:
-                x = np.hstack([x, self.animation.positions.reshape(nf, -1)])
+                x = np.hstack([x, self.positions.reshape(nf, -1)])
                 w = np.hstack([w, self.weights_translate.repeat(3)])
             
             """ Generate Jacobian """
             if self.recalculate or i == 0:
-                j = self.jacobian(x, gp, gr, self.targets, self.first_descendants, self.first_tdescendants)
+                j = self.jacobian(x, translations, orientations, self.targets, self.first_descendants, self.first_tdescendants)
             
             """ Update Variables """            
             l = self.damping * (1.0 / (w + 0.001))
             d = (l*l) * np.eye(x.shape[1])
-            e = gamma * (self.endeff.reshape(nf,-1) - gp[:,np.array(list(self.targets.keys()))].reshape(nf, -1))
+            e = gamma * (self.endeff.reshape(nf, -1) - translations[:, np.array(list(self.targets.keys()))].reshape(nf, -1))
             
             x += np.array(list(map(lambda jf, ef:
                 linalg.lu_solve(linalg.lu_factor(jf.T.dot(jf) + d), jf.T.dot(ef)), j, e)))
@@ -300,27 +324,27 @@ class JacobianInverseKinematics:
                     np.eye(x.shape[1]) - linalg.solve(jf.T.dot(jf) + d, jf.T.dot(jf)), j)))
                     
                 if self.recalculate or i == 0:
-                    j2 = self.jacobian(x, gp, gr, self.second_targets, self.second_descendants, self.second_tdescendants)
+                    j2 = self.jacobian(x, translations, orientations, self.second_targets, self.second_descendants, self.second_tdescendants)
                         
-                e2 = self.secondary * (self.references.reshape(nf, -1) - gp.reshape(nf, -1))
+                e2 = self.secondary * (self.references.reshape(nf, -1) - translations.reshape(nf, -1))
                 
                 x += np.array(list(map(lambda nsf, j2f, e2f:
                     nsf.dot(linalg.lu_solve(linalg.lu_factor(j2f.T.dot(j2f) + d), j2f.T.dot(e2f))), ns, j2, e2)))
 
             """ Set Back Rotations / Translations """
-            self.animation.rotations = Quaternions.from_euler(
-                x[:,:nj*3].reshape((nf, nj, 3)), order='xyz', world=True)
+            x_rot = x[:, :nj * 3].reshape((nf, nj, 3))
+            for j in range(nj):
+                self.rotations[:,j] = R.from_euler('XYZ', x_rot[:,j]).as_quat()
                 
             if self.translate:
-                self.animation.positions = x[:,nj*3:].reshape((nf,nj, 3))
+                self.positions = x[:,nj*3:].reshape((nf, nj, 3))
                 
             """ Generate Error """
-            
             if not self.silent:
-                gp = Animation.positions_global(self.animation)
-                gp = gp[:,np.array(list(self.targets.keys()))]
-                error = np.mean(np.sum((self.endeff - gp)**2.0, axis=2)**0.5)
-                print('[JacobianInverseKinematics] Iteration %i | Error: %f' % (i+1, error))
+                translations, _ = forward_kinematics(self.positions, self.rotations, self.parents)
+                ee_translations = translations[:,np.array(list(self.targets.keys()))]     
+                error = np.mean(np.sqrt(np.sum((self.endeff - ee_translations)**2.0, axis=2)))
+                print('[JacobianInverseKinematics] Start | Error: %f' % error)
             
 
 class BasicJacobianIK:
