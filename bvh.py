@@ -1,3 +1,13 @@
+'''
+Copyright (c) 2025, Blusque (Jidong Mei)
+License: MIT (see LICENSE for details)
+
+@author: Blusque (Jidong Mei)
+@summary: BVH Parser and Animation Data Class
+This module provides a parser for BVH files and a class to handle animation data.
+It includes functions for reading BVH files, performing forward kinematics, and manipulating animation data.
+'''
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from kinematics import JacobianInverseKinematics
@@ -289,6 +299,12 @@ class Animation:
         return new_parents
     
     def child(self, joint_list: list[int] | np.ndarray, root_idx=0):
+        '''
+        Cut the animation data to only keep the given joints. Changed the root joint to the given root joint.
+        Input:
+            joint_list: list[int] | np.ndarray, the list of joint indices to keep.
+            root_idx: int, the index of the new root joint.    
+        '''
         new_parents = self._reparent(joint_list, root_idx)
         new_channels = self.channels[joint_list].copy()
         new_channels[root_idx] = 6
@@ -298,6 +314,9 @@ class Animation:
         return Animation(new_names, root_idx, new_parents, self.offsets[joint_list].copy(), new_channels, self.positions[:, joint_list].copy(), new_rotations, self.frame_time, self.up_axis, self.forward_axis, self.order)
     
     def rest(self):
+        '''
+        Get the rest pose of the animation.
+        '''
         rest_position = np.zeros_like(self.translations[:1])
         rest_rotation = np.zeros_like(self.rotations[:1])
         rest_rotation[..., -1] = 1
@@ -306,6 +325,9 @@ class Animation:
         return rest_motion
     
     def offset_snap_to_ground(self):
+        '''
+        Snap the foot joint to the ground plane.
+        '''
         rest = self.rest()
         up_idx = Animation.axis_map[self.up_axis]
         rest_foot_position = np.min(rest.translations[0, :, up_idx])
@@ -313,9 +335,12 @@ class Animation:
         self.reset()
 
     def motion_snap_to_ground(self):
+        '''
+        Snap the foot in the whole motion to the ground plane.
+        '''
         up_idx = Animation.axis_map[self.up_axis]
-        left_foot_idx = 16
-        right_foot_idx = 19
+        # left_foot_idx = 16
+        # right_foot_idx = 19
         # lowest = softmin(self.translations[:, [left_foot_idx, right_foot_idx], up_idx])
         lowest = np.min(self.translations[:, :, up_idx], axis=(0, 1))
         if abs(lowest) > 1e-6:
@@ -434,6 +459,12 @@ class Animation:
     #     self.reset()
 
     def rotate_offset(self, up_axis: str):
+        '''
+        Rotate the offsets to the given up axis.
+
+        Input:
+            up_axis: str, 'y' or 'z'
+        '''
         warn('This function is experimental and may not work as expected')
         warn("How to change the axis of the offset? We have to know that rotation doesn't work, if you don't believe it, try to")
         assert self.up_axis is not None, 'Up axis not set'
